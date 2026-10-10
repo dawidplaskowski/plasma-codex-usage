@@ -5,6 +5,7 @@ import org.kde.plasma.components as PlasmaComponents
 import org.kde.kirigami as Kirigami
 import org.kde.plasma.plasma5support as Plasma5Support
 import org.kde.plasma.core as PlasmaCore
+import QtQuick.LocalStorage
 
 PlasmoidItem {
     id: root
@@ -130,67 +131,86 @@ PlasmoidItem {
     }
 
     // ────────────────────────────────────────────────
-    // Cache writer
+    // Cache
     // ────────────────────────────────────────────────
-    Plasma5Support.DataSource {
-        id: cacheWriter
-        engine: "executable"
-        connectedSources: []
-        onNewData: function(sourceName, data) { disconnectSource(sourceName) }
+    // Plasma's executable engine keeps every command it has ever run for as
+    // long as the engine stays loaded, which in plasmashell is for good. Writing
+    // the cache as `echo '<json>' > file` made each refresh a new command
+    // holding the whole JSON, so plasmashell grew by megabytes per refresh.
+    // The cache lives in LocalStorage instead, where the JSON is a bound value,
+    // not part of any command.
+    function cacheDb() {
+        var db = LocalStorage.openDatabaseSync("CodexUsageCache", "", "Codex Usage cache", 1000000)
+        db.transaction(function(tx) {
+            tx.executeSql("CREATE TABLE IF NOT EXISTS cache(key TEXT PRIMARY KEY, json TEXT)")
+        })
+        return db
     }
 
-    // ────────────────────────────────────────────────
-    // Cache reader
-    // ────────────────────────────────────────────────
+    function loadCache() {
+        var json = ""
+        cacheDb().readTransaction(function(tx) {
+            var rows = tx.executeSql("SELECT json FROM cache WHERE key = 'default'").rows
+            if (rows.length > 0) json = rows.item(0).json
+        })
+        if (json) applyCache(json)
+        // Nothing stored yet: pick up the cache file written before 1.2.1.
+        else cacheReader.connectSource("cat $HOME/.local/share/codex-usage-cache.json 2>/dev/null")
+    }
+
+    // Legacy cache file reader, used once after upgrading
     Plasma5Support.DataSource {
         id: cacheReader
         engine: "executable"
         connectedSources: []
 
         onNewData: function(sourceName, data) {
-            var stdout = (data["stdout"] || "").trim()
             disconnectSource(sourceName)
-            if (sourceName.indexOf("codex-usage-cache") !== -1) root.cacheLoaded = true
-            if (stdout.length > 10) {
-                try {
-                    var cache = JSON.parse(stdout)
-                    var age = Date.now() - (cache.timestamp || 0)
-                    if (age < 86400000) {
-                        root.weeklyUsagePercent = cache.weekly || 0
-                        root.weeklyWindowMinutes = cache.weeklyWindowMinutes || 10080
-                        root.weeklyResetTime = cache.weeklyResetTs ? new Date(cache.weeklyResetTs) : null
-                        root.hasSecondary = cache.hasSecondary || false
-                        root.secondaryUsagePercent = cache.secondary || 0
-                        root.secondaryWindowMinutes = cache.secondaryWindowMinutes || 0
-                        root.secondaryResetTime = cache.secondaryResetTs ? new Date(cache.secondaryResetTs) : null
-                        root.planName = cache.plan || ""
-                        root.totalInputTokens = cache.totalInput || 0
-                        root.totalOutputTokens = cache.totalOutput || 0
-                        root.totalCachedTokens = cache.totalCached || 0
-                        root.totalReasoningTokens = cache.totalReasoning || 0
-                        root.lastInputTokens = cache.lastInput || 0
-                        root.lastOutputTokens = cache.lastOutput || 0
-                        var cachedSamples = cache.samples || []
-                        var mergedS = cachedSamples.concat(root.usageSamples)
-                        mergedS.sort(function(a, b) { return a.t - b.t })
-                        var dedupS = []
-                        for (var si = 0; si < mergedS.length; si++) {
-                            if (dedupS.length === 0 || mergedS[si].t > dedupS[dedupS.length - 1].t) dedupS.push(mergedS[si])
-                        }
-                        root.usageSamples = dedupS
-                        root.lastSuccessTime = cache.timestamp
-                        root.lastUpdate = Qt.formatTime(new Date(cache.timestamp), "hh:mm:ss") + " *"
-                        root.isStale = age > root.staleThresholdMs
-                        console.log("Codex Usage: Loaded cache, age:", Math.round(age / 60000), "min, stale:", root.isStale)
-                        root.cacheLoaded = true
-                    } else {
-                        console.log("Codex Usage: Cache too old, ignoring")
-                    }
-                } catch (e) {
-                    console.log("Codex Usage: Cache parse error:", e)
-                }
-            }
+            applyCache((data["stdout"] || "").trim())
         }
+    }
+
+    function applyCache(stdout) {
+        root.cacheLoaded = true
+    if (stdout.length > 10) {
+        try {
+            var cache = JSON.parse(stdout)
+            var age = Date.now() - (cache.timestamp || 0)
+            if (age < 86400000) {
+                root.weeklyUsagePercent = cache.weekly || 0
+                root.weeklyWindowMinutes = cache.weeklyWindowMinutes || 10080
+                root.weeklyResetTime = cache.weeklyResetTs ? new Date(cache.weeklyResetTs) : null
+                root.hasSecondary = cache.hasSecondary || false
+                root.secondaryUsagePercent = cache.secondary || 0
+                root.secondaryWindowMinutes = cache.secondaryWindowMinutes || 0
+                root.secondaryResetTime = cache.secondaryResetTs ? new Date(cache.secondaryResetTs) : null
+                root.planName = cache.plan || ""
+                root.totalInputTokens = cache.totalInput || 0
+                root.totalOutputTokens = cache.totalOutput || 0
+                root.totalCachedTokens = cache.totalCached || 0
+                root.totalReasoningTokens = cache.totalReasoning || 0
+                root.lastInputTokens = cache.lastInput || 0
+                root.lastOutputTokens = cache.lastOutput || 0
+                var cachedSamples = cache.samples || []
+                var mergedS = cachedSamples.concat(root.usageSamples)
+                mergedS.sort(function(a, b) { return a.t - b.t })
+                var dedupS = []
+                for (var si = 0; si < mergedS.length; si++) {
+                    if (dedupS.length === 0 || mergedS[si].t > dedupS[dedupS.length - 1].t) dedupS.push(mergedS[si])
+                }
+                root.usageSamples = dedupS
+                root.lastSuccessTime = cache.timestamp
+                root.lastUpdate = Qt.formatTime(new Date(cache.timestamp), "hh:mm:ss") + " *"
+                root.isStale = age > root.staleThresholdMs
+                console.log("Codex Usage: Loaded cache, age:", Math.round(age / 60000), "min, stale:", root.isStale)
+                root.cacheLoaded = true
+            } else {
+                console.log("Codex Usage: Cache too old, ignoring")
+            }
+        } catch (e) {
+            console.log("Codex Usage: Cache parse error:", e)
+        }
+    }
     }
 
     function saveCache() {
@@ -213,7 +233,9 @@ PlasmoidItem {
             timestamp: Date.now()
         }
         var json = JSON.stringify(cache)
-        cacheWriter.connectSource("echo '" + json.replace(/'/g, "'\\''") + "' > $HOME/.local/share/codex-usage-cache.json")
+        cacheDb().transaction(function(tx) {
+            tx.executeSql("INSERT OR REPLACE INTO cache(key, json) VALUES('default', ?)", [json])
+        })
     }
 
     // ────────────────────────────────────────────────
@@ -1344,7 +1366,7 @@ PlasmoidItem {
         reloadQuickLinks()
         var iconSource = Qt.resolvedUrl("../icons/codex-usage-widget.svg").toString().replace("file://", "")
         iconInstaller.connectSource("bash -c 'ICON_DIR=${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps && mkdir -p $ICON_DIR && cp \"" + iconSource + "\" $ICON_DIR/codex-usage-widget.svg && chmod 644 $ICON_DIR/codex-usage-widget.svg 2>/dev/null'")
-        cacheReader.connectSource("cat $HOME/.local/share/codex-usage-cache.json 2>/dev/null")
+        loadCache()
         authReader.connectSource("cat ${CODEX_CONFIG_DIR:-$HOME/.codex}/auth.json 2>/dev/null")
         versionReader.connectSource("codex --version 2>/dev/null")
         if (Plasmoid.configuration.enableUpdateCheck !== false) checkForUpdate()
