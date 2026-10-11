@@ -8,7 +8,7 @@ A KDE Plasma 6 widget that displays your OpenAI Codex CLI usage statistics in th
 
 ## Features
 
-- **100% Local**: Reads rate-limit snapshots from Codex CLI session logs (`~/.codex/sessions/`) — no network calls, no API keys
+- **Current limits**: Asks chatgpt.com with the token Codex CLI already stored, the same request as its `/status`; when that token has expired, falls back to the rate-limit snapshots in Codex CLI session logs (`~/.codex/sessions/`) — no API keys
   ![Panel](screenshots/panel.png)
 - **Weekly & Secondary Limits**: Usage percentages with reset countdowns, straight from the Codex CLI's own `rate_limits` data
 - **Time-Proportional Coloring**: Colors based on elapsed time vs usage ratio (configurable, can switch to fixed thresholds)
@@ -51,11 +51,11 @@ cd plasma-codex-usage
 
 1. Make sure you're logged in to Codex CLI (run `codex` in a terminal at least once)
 2. Add the widget to your panel: right-click panel → "Add Widgets..." → search for "Codex Usage"
-3. The widget reads the latest rate-limit snapshot from your local session logs and refreshes periodically
+3. The widget fetches the current limits (or reads the latest snapshot from your local session logs) and refreshes periodically
 
 ## How It Works
 
-The Codex CLI writes a `rate_limits` snapshot into its session logs (`~/.codex/sessions/*.jsonl`) with every request. The widget tails the most recent logs and displays the latest snapshot — so the data is exactly what the CLI itself last saw, with zero extra API traffic. Account email and plan are read locally from `~/.codex/auth.json`.
+The widget asks `chatgpt.com/backend-api/wham/usage` for the current limits, using the access token Codex CLI keeps in `~/.codex/auth.json`. It never refreshes that token itself (that would rotate it behind the CLI's back), so after a few days without Codex the request fails and the widget falls back to the `rate_limits` snapshot the CLI writes into its session logs (`~/.codex/sessions/*.jsonl`) with every request. Such a snapshot is only as fresh as the last Codex run: windows whose reset time has passed show 0%, the footer shows the snapshot's age, and the widget dims once it is stale. Account email and plan are read locally from `~/.codex/auth.json`.
 
 ## Credits
 

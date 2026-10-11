@@ -172,45 +172,57 @@ PlasmoidItem {
 
     function applyCache(stdout) {
         root.cacheLoaded = true
-    if (stdout.length > 10) {
-        try {
-            var cache = JSON.parse(stdout)
-            var age = Date.now() - (cache.timestamp || 0)
-            if (age < 86400000) {
-                root.weeklyUsagePercent = cache.weekly || 0
-                root.weeklyWindowMinutes = cache.weeklyWindowMinutes || 10080
-                root.weeklyResetTime = cache.weeklyResetTs ? new Date(cache.weeklyResetTs) : null
-                root.hasSecondary = cache.hasSecondary || false
-                root.secondaryUsagePercent = cache.secondary || 0
-                root.secondaryWindowMinutes = cache.secondaryWindowMinutes || 0
-                root.secondaryResetTime = cache.secondaryResetTs ? new Date(cache.secondaryResetTs) : null
-                root.planName = cache.plan || ""
-                root.totalInputTokens = cache.totalInput || 0
-                root.totalOutputTokens = cache.totalOutput || 0
-                root.totalCachedTokens = cache.totalCached || 0
-                root.totalReasoningTokens = cache.totalReasoning || 0
-                root.lastInputTokens = cache.lastInput || 0
-                root.lastOutputTokens = cache.lastOutput || 0
-                var cachedSamples = cache.samples || []
-                var mergedS = cachedSamples.concat(root.usageSamples)
-                mergedS.sort(function(a, b) { return a.t - b.t })
-                var dedupS = []
-                for (var si = 0; si < mergedS.length; si++) {
-                    if (dedupS.length === 0 || mergedS[si].t > dedupS[dedupS.length - 1].t) dedupS.push(mergedS[si])
+        if (stdout.length > 10) {
+            try {
+                var cache = JSON.parse(stdout)
+                var age = Date.now() - (cache.timestamp || 0)
+                if (age < 86400000) {
+                    root.weeklyUsagePercent = activePct(cache.weekly, cache.weeklyResetTs)
+                    root.weeklyWindowMinutes = cache.weeklyWindowMinutes || 10080
+                    root.weeklyResetTime = cache.weeklyResetTs ? new Date(cache.weeklyResetTs) : null
+                    root.hasSecondary = cache.hasSecondary || false
+                    root.secondaryUsagePercent = activePct(cache.secondary, cache.secondaryResetTs)
+                    root.secondaryWindowMinutes = cache.secondaryWindowMinutes || 0
+                    root.secondaryResetTime = cache.secondaryResetTs ? new Date(cache.secondaryResetTs) : null
+                    root.planName = cache.plan || ""
+                    root.totalInputTokens = cache.totalInput || 0
+                    root.totalOutputTokens = cache.totalOutput || 0
+                    root.totalCachedTokens = cache.totalCached || 0
+                    root.totalReasoningTokens = cache.totalReasoning || 0
+                    root.lastInputTokens = cache.lastInput || 0
+                    root.lastOutputTokens = cache.lastOutput || 0
+                    var cachedSamples = cache.samples || []
+                    var mergedS = cachedSamples.concat(root.usageSamples)
+                    mergedS.sort(function(a, b) { return a.t - b.t })
+                    var dedupS = []
+                    for (var si = 0; si < mergedS.length; si++) {
+                        if (dedupS.length === 0 || mergedS[si].t > dedupS[dedupS.length - 1].t) dedupS.push(mergedS[si])
+                    }
+                    root.usageSamples = dedupS
+                    root.lastSuccessTime = cache.timestamp
+                    root.lastUpdate = Qt.formatTime(new Date(cache.timestamp), "hh:mm:ss") + " *"
+                    root.isStale = age > root.staleThresholdMs
+                    console.log("Codex Usage: Loaded cache, age:", Math.round(age / 60000), "min, stale:", root.isStale)
+                    root.cacheLoaded = true
+                } else {
+                    console.log("Codex Usage: Cache too old, ignoring")
                 }
-                root.usageSamples = dedupS
-                root.lastSuccessTime = cache.timestamp
-                root.lastUpdate = Qt.formatTime(new Date(cache.timestamp), "hh:mm:ss") + " *"
-                root.isStale = age > root.staleThresholdMs
-                console.log("Codex Usage: Loaded cache, age:", Math.round(age / 60000), "min, stale:", root.isStale)
-                root.cacheLoaded = true
-            } else {
-                console.log("Codex Usage: Cache too old, ignoring")
+            } catch (e) {
+                console.log("Codex Usage: Cache parse error:", e)
             }
-        } catch (e) {
-            console.log("Codex Usage: Cache parse error:", e)
         }
     }
+
+    // A window whose reset time has passed was used 0% so far: snapshots from
+    // the logs keep the old value until Codex runs again.
+    function activePct(pct, resetMs) {
+        return resetMs > 0 && resetMs <= Date.now() ? 0 : (pct || 0)
+    }
+
+    // wham/usage window -> the window shape of the session logs
+    function liveWindow(w) {
+        if (!w) return null
+        return { used_percent: w.used_percent, window_minutes: Math.round((w.limit_window_seconds || 0) / 60), resets_at: w.reset_at }
     }
 
     function saveCache() {
@@ -230,7 +242,7 @@ PlasmoidItem {
             lastInput: root.lastInputTokens,
             lastOutput: root.lastOutputTokens,
             samples: root.usageSamples,
-            timestamp: Date.now()
+            timestamp: root.lastSuccessTime
         }
         var json = JSON.stringify(cache)
         cacheDb().transaction(function(tx) {
@@ -489,43 +501,68 @@ PlasmoidItem {
             disconnectSource(sourceName)
             root.isLoading = false
 
-            if (stdout === "NODATA" || stdout.length < 5) {
-                root.errorMsg = i18n.tr("No session logs found")
-                console.log("Codex Usage: No data from fetch script")
-                return
-            }
-
             try {
-                // The fetch script emits one line per limit type: the account
-                // limit first, then any extra model quotas (e.g. Codex-Spark).
-                var lines = stdout.split("\n").filter(function(l) { return l.trim().length > 2 })
-                var extras = []
-                for (var li = 1; li < lines.length; li++) {
-                    try {
-                        var xEntry = JSON.parse(lines[li])
-                        var xrl = (xEntry.payload || xEntry).rate_limits || {}
-                        var xp = xrl.primary || {}
-                        var xs = xrl.secondary || {}
-                        extras.push({
-                            name: xrl.limit_name || xrl.limit_id || "?",
-                            primaryPct: xp.used_percent !== undefined ? xp.used_percent : -1,
-                            primaryWindowMin: xp.window_minutes || 0,
-                            secondaryPct: xs.used_percent !== undefined ? xs.used_percent : -1,
-                            secondaryWindowMin: xs.window_minutes || 0
+                // The fetch script emits the live limits ("LIVE <json>") when
+                // the token still works, then one log line per limit type: the
+                // account limit first, then any extra model quotas (e.g.
+                // Codex-Spark).
+                var lines = stdout.split("\n").filter(function(l) { return l.trim().length > 2 && l !== "NODATA" })
+                var live = null
+                if (lines.length > 0 && lines[0].indexOf("LIVE ") === 0) {
+                    try { live = JSON.parse(lines.shift().slice(5)) }
+                    catch (le) { console.log("Codex Usage: Live data parse error:", le) }
+                }
+                if (!live && lines.length === 0) {
+                    root.errorMsg = i18n.tr("No session logs found")
+                    console.log("Codex Usage: No data from fetch script")
+                    return
+                }
+
+                var entry = lines.length > 0 ? JSON.parse(lines[0]) : {}
+                var payload = entry.payload || entry
+                var info = payload.info || {}
+                var rateLimits, extraLimits = []
+                if (live) {
+                    var rl = live.rate_limit || {}
+                    rateLimits = { plan_type: live.plan_type, primary: liveWindow(rl.primary_window), secondary: liveWindow(rl.secondary_window) }
+                    var additional = live.additional_rate_limits || []
+                    for (var ai = 0; ai < additional.length; ai++) {
+                        var arl = additional[ai].rate_limit || {}
+                        extraLimits.push({
+                            limit_name: additional[ai].limit_name || additional[ai].metered_feature,
+                            primary: liveWindow(arl.primary_window),
+                            secondary: liveWindow(arl.secondary_window)
                         })
-                    } catch (xe) { }
+                    }
+                } else {
+                    rateLimits = payload.rate_limits || {}
+                    for (var li = 1; li < lines.length; li++) {
+                        try {
+                            var xEntry = JSON.parse(lines[li])
+                            extraLimits.push((xEntry.payload || xEntry).rate_limits || {})
+                        } catch (xe) { }
+                    }
+                }
+
+                var extras = []
+                for (var ei = 0; ei < extraLimits.length; ei++) {
+                    var xrl = extraLimits[ei]
+                    var xp = xrl.primary || {}
+                    var xs = xrl.secondary || {}
+                    extras.push({
+                        name: xrl.limit_name || xrl.limit_id || "?",
+                        primaryPct: xp.used_percent !== undefined ? activePct(xp.used_percent, xp.resets_at * 1000) : -1,
+                        primaryWindowMin: xp.window_minutes || 0,
+                        secondaryPct: xs.used_percent !== undefined ? activePct(xs.used_percent, xs.resets_at * 1000) : -1,
+                        secondaryWindowMin: xs.window_minutes || 0
+                    })
                 }
                 root.extraQuotas = extras
-
-                var entry = JSON.parse(lines[0])
-                var payload = entry.payload || entry
-                var rateLimits = payload.rate_limits || {}
-                var info = payload.info || {}
 
                 // Primary usage
                 var primary = rateLimits.primary
                 if (primary) {
-                    root.weeklyUsagePercent = primary.used_percent || 0
+                    root.weeklyUsagePercent = activePct(primary.used_percent, primary.resets_at * 1000)
                     root.weeklyWindowMinutes = primary.window_minutes || 10080
                     if (primary.resets_at) {
                         root.weeklyResetTime = new Date(primary.resets_at * 1000)
@@ -536,7 +573,7 @@ PlasmoidItem {
                 var secondary = rateLimits.secondary
                 if (secondary && typeof secondary === "object") {
                     root.hasSecondary = true
-                    root.secondaryUsagePercent = secondary.used_percent || 0
+                    root.secondaryUsagePercent = activePct(secondary.used_percent, secondary.resets_at * 1000)
                     root.secondaryWindowMinutes = secondary.window_minutes || 0
                     if (secondary.resets_at) {
                         root.secondaryResetTime = new Date(secondary.resets_at * 1000)
@@ -574,9 +611,11 @@ PlasmoidItem {
                     root.snapshotAt = new Date(entry.timestamp)
                 }
 
-                root.lastUpdate = Qt.formatTime(new Date(), "hh:mm:ss")
-                root.lastSuccessTime = Date.now()
-                root.isStale = false
+                // Without live data the values are as old as the log snapshot
+                var dataTime = (!live && entry.timestamp) ? Date.parse(entry.timestamp) : Date.now()
+                root.lastUpdate = Qt.formatDateTime(new Date(dataTime), Date.now() - dataTime < 86400000 ? "hh:mm:ss" : "dd.MM hh:mm")
+                root.lastSuccessTime = dataTime
+                root.isStale = Date.now() - dataTime > root.staleThresholdMs
                 root.errorMsg = ""
 
                 // Trend history

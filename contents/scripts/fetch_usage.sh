@@ -1,11 +1,42 @@
 #!/bin/sh
-# Read the latest Codex CLI rate-limit snapshot from local session logs.
-# No network calls — everything comes from ~/.codex/sessions/.
+# Report Codex rate limits.
 #
-# Output: JSON with usage data, or "NODATA" if no logs found.
+# Output, line by line:
+#   "LIVE <json>"  current limits from chatgpt.com (the endpoint Codex CLI
+#                  uses for /status), only when the stored token still works
+#   <json>...      the latest snapshot per limit from local session logs,
+#                  which also carry the token stats; or "NODATA"
+#
+# Log snapshots are only as fresh as the last Codex run, and they miss limit
+# resets that happen in between, hence the live query first. The token is
+# never refreshed here: that rotates the refresh token behind Codex's back.
 
 CODEX_DIR="${CODEX_CONFIG_DIR:-$HOME/.codex}"
 SESSIONS="$CODEX_DIR/sessions"
+
+AUTH=$(tr -d '\n\r' < "$CODEX_DIR/auth.json" 2>/dev/null)
+field() {
+    printf '%s' "$AUTH" | grep -o "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" \
+        | head -n 1 | sed 's/.*:[[:space:]]*"//;s/"$//'
+}
+TOKEN=$(field access_token)
+ACCOUNT=$(field account_id)
+# Both are single opaque words. Anything else means extraction went wrong,
+# and passing it on would inject extra lines into the curl header block.
+case "$TOKEN$ACCOUNT" in
+    *[!A-Za-z0-9_.=-]*) TOKEN="" ;;
+esac
+if [ -n "$TOKEN" ]; then
+    # Headers via stdin (-H @-) so the token never appears in process arguments.
+    RESP=$(printf 'Authorization: Bearer %s\nChatGPT-Account-Id: %s\n' "$TOKEN" "$ACCOUNT" \
+        | curl -sS --max-time 10 -H @- -w '\n%{http_code}' \
+            "https://chatgpt.com/backend-api/wham/usage" 2>/dev/null)
+    if [ "${RESP##*
+}" = 200 ]; then
+        printf 'LIVE %s\n' "$(printf '%s' "${RESP%
+*}" | tr -d '\n\r')"
+    fi
+fi
 
 if [ ! -d "$SESSIONS" ]; then
     echo "NODATA"
